@@ -1,0 +1,60 @@
+# Multi-Agent DFT Research System Default Configuration
+
+# General system configuration
+system:
+  name: "Multi-Agent DFT Research System"
+  version: "1.0.0"
+  log_level: "INFO"
+  cache_dir: "~/.multi_agent_dft/cache"
+  output_dir: "~/multi_agent_dft_output"
+
+# API configuration
+api:
+  publication:
+    default_source: "arxiv"
+    max_results: 10
+    cache_enabled: true
+    cache_ttl: 86400  # 24 hours in seconds
+    user_agent: "Multi-Agent DFT System/1.0 (research assistant; contact@example.org)"
+    endpoints:
+      arxiv: "http://export.arxiv.org/api/query"
+      # Add other API endpoints as needed
+
+# Agent configuration
+agents:
+  models:
+    default: "gpt-3.5-turbo"
+    premium: "gpt-5-mini"
+  experimental_chemist:
+    name: "ExperimentalChemistAgent"
+    model: "gpt-5-mini"
+    focus_keywords: ["experiment", "synthesis", "measurement", "characterization"]
+  theoretical_chemist:
+    name: "TheoreticalChemistAgent"
+    model: "gpt-5-mini"
+    focus_keywords: ["theory", "simulation", "DFT", "model", "computational"]
+  dft_experts:
+    gaussian:
+      name: "GaussianExpertAgent"
+      model: "gpt-5-mini"
+      doc_url: "https://gaussian.com/man/"
+      keywords: ["Gaussian", "DFT", "quantum chemistry", "basis set", "functional"]
+    vasp:
+      name: "VASPExpertAgent"
+      model: "gpt-5-mini"
+      doc_url: "https://www.vasp.at/wiki/index.php/The_VASP_Manual"
+      keywords: ["VASP", "DFT", "periodic", "crystal", "plane wave"]
+    cp2k:
+      name: "CP2KExpertAgent"
+      model: "gpt-5-mini"
+      doc_url: "https://www.cp2k.org/documentation"
+      keywords: ["CP2K", "DFT", "AIMD", "mixed basis", "GPW"]
+
+# File processing configuration
+file_processing:
+  supported_formats:
+    - "xyz"
+    - "cif"
+  validation:
+    max_file_size: 10485760  # 10 MB
+    timeout: 30  # seconds
