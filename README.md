@@ -1,5 +1,3 @@
-# Automated Machine Learning Pipeline
-
 ![AMLP Logo](amlp_logo.png)
 
 The Automated Machine Learning Pipeline (AMLP) provides an integrated framework that unifies the entire workflow from dataset creation to model validation. It leverages large language model (LLM) agents to assist with electronic-structure code selection, thereby reducing the manual effort typically required. AMLP also incorporates automated dataset tools for efficient input generation—including geometry (or cell) optimizations and ab initio molecular dynamics (AIMD)—as well as output conversion and preparation of data in the MACE-compatible format. It supports three DFT packages—Gaussian, VASP, and CP2K—ensuring flexibility across different electronic-structure environments. Its analysis module, AMLP-Analysis (built on ASE), further supports a broad range of molecular simulations, enabling systematic evaluation and validation of machine learning interatomic potentials.
