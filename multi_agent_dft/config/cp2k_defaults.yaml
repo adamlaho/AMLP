@@ -1,0 +1,73 @@
+# CP2K Default Configuration
+
+global:
+  RUN_TYPE: "CELL_OPT"
+  PRINT_LEVEL: "LOW"
+  PROJECT: "my_project"
+
+dft:
+  BASIS_SET_FILE_NAME: "BASIS_MOLOPT"
+  POTENTIAL_FILE_NAME: "GTH_POTENTIALS"
+
+mgrid:
+  NGRIDS: 4
+  CUTOFF: 1200
+  REL_CUTOFF: 40
+
+qs:
+  EPS_DEFAULT: 1.0E-10
+
+scf:
+  SCF_GUESS: "ATOMIC"
+  MAX_SCF: 1
+  EPS_SCF: 1.0E-6
+  ADDED_MOS: 10
+  CHOLESKY: "INVERSE"
+  IGNORE_CONVERGENCE_FAILURE: "TRUE"
+
+outer_scf:
+  MAX_SCF: 50
+  EPS_SCF: 5.0E-6
+
+xc:
+  xc_grid:
+    XC_DERIV: "NN50_SMOOTH"
+  xc_functional:
+    XC_FUNCTIONAL: "PBE"
+  vdw_potential:
+    POTENTIAL_TYPE: "PAIR_POTENTIAL"
+    pair_potential:
+      TYPE: "DFTD4"
+      R_CUTOFF: 10.0
+      LONG_RANGE_CORRECTION: ""
+      REFERENCE_FUNCTIONAL: "PBE"
+      PARAMETER_FILE_NAME: "dftd4.dat"
+
+kind_parameters:
+  H:
+    BASIS_SET: "ORB TZV2P-MOLOPT-PBE-GTH-q1"
+    POTENTIAL: "GTH-PBE-q1"
+  C:
+    BASIS_SET: "ORB TZV2P-MOLOPT-PBE-GTH-q4"
+    POTENTIAL: "GTH-PBE-q4"
+  N:
+    BASIS_SET: "ORB TZV2P-MOLOPT-PBE-GTH-q5"
+    POTENTIAL: "GTH-PBE-q5"
+  O:
+    BASIS_SET: "ORB TZV2P-MOLOPT-PBE-GTH-q6"
+    POTENTIAL: "GTH-PBE-q6"
+  F:
+    BASIS_SET: "ORB aug-TZV2P-GTH-q7"
+    POTENTIAL: "GTH-PBE-q7"
+  Si:
+    BASIS_SET: "ORB aug-TZV2P-GTH-q4"
+    POTENTIAL: "GTH-PBE-q4"
+  Cl:
+    BASIS_SET: "ORB aug-TZV2P-GTH-q7"
+    POTENTIAL: "GTH-PBE-q7"
+  Br:
+    BASIS_SET: "ORB TZV2P-MOLOPT-PBE-GTH-q7"
+    POTENTIAL: "GTH-PBE-q7"
+  I:
+    BASIS_SET: "ORB TZV2P-MOLOPT-PBE-GTH-q7"
+    POTENTIAL: "GTH-PBE-q7"
