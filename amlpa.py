@@ -6,6 +6,7 @@ Description:
     - Cell optimization
     - Phonon calculations  
     - MD simulations (NVE, NVT with Langevin/Berendsen/Nosé-Hoover)
+    - Thermodynamic integration for free energy calculations
     - RDF analysis with proper normalization (converges to 1)
     - Energy drift analysis (cumulative and instantaneous)
     - RMSD analysis
@@ -43,6 +44,7 @@ from ase.optimize import BFGS, LBFGS, FIRE
 from ase.filters import StrainFilter
 from ase.build import make_supercell
 from ase.geometry import find_mic
+from ase.calculators.calculator import Calculator, all_changes
 
 # Import analysis modules
 from multi_agent_dft.analysis import MDFreeEnergy
@@ -219,6 +221,8 @@ class MDAnalyzer:
         self.atoms = None
         self.initial_atoms = None
         self.simulation_cell_replicated = False
+        self.ref_positions = None 
+        self.ref_energy_at_q0 = None 
         
     def _load_config(self, config_file: str) -> dict:
         """Load configuration from YAML file"""
@@ -581,6 +585,10 @@ class MDAnalyzer:
             opt.run(fmax=fmax)
             
             final_energy = self.atoms.get_potential_energy()
+            self.ref_positions = self.atoms.get_positions().copy()
+            self.ref_energy_at_q0 = final_energy
+            self.logger.log(f"TI reference positions stored: {len(self.ref_positions)} atoms")
+            self.logger.log(f"TI reference energy U(q0) = {self.ref_energy_at_q0:.8f} eV")
             self.logger.log(f"Optimization completed in {step_count[0]} steps")
             self.logger.log(f"Final energy: {final_energy:.6f} eV")
             
@@ -777,6 +785,400 @@ class MDAnalyzer:
             return False
 
 
+    def fit_einstein_kappa(self, temperature: float) -> float:
+        """
+        Auto-fit the Einstein spring constant kappa from a short NVT pre-run.
+
+        From classical equipartition in 3D:
+            <|r_i - r0_i|^2> = 3 * k_B * T / kappa   (per atom)
+
+        Therefore:
+            kappa = 3 * k_B * T / mean_over_atoms( <|r_i - r0_i|^2> )
+
+        The short pre-run uses the physical (MACE) potential so that the
+        spring constant matches the true anharmonic fluctuations at the
+        target temperature.
+
+        Parameters
+        ----------
+        temperature : float
+            Target temperature in Kelvin.
+
+        Returns
+        -------
+        kappa : float
+            Fitted spring constant in eV/Ang^2.
+        """
+        ti_config = self.config.get('thermodynamic_integration', {})
+        kappa_fit_steps = ti_config.get('kappa_fit_steps', 2000)
+        kappa_sample_interval = ti_config.get('kappa_sample_interval', 10)
+
+        self.logger.log_section(f"EINSTEIN KAPPA AUTO-FIT at {temperature} K")
+        self.logger.log(f"Pre-run: {kappa_fit_steps} steps, sampling every "
+                        f"{kappa_sample_interval} steps with physical potential")
+
+        if self.ref_positions is None:
+            raise RuntimeError(
+                "ref_positions is None.  Run geometry optimisation first "
+                "(geo_opt: true in config) so that q0 is defined."
+            )
+
+        # Temporarily use the physical calculator
+        original_calc = self.atoms.calc
+        self.atoms.calc = self._calculator
+
+        MaxwellBoltzmannDistribution(self.atoms, temperature_K=temperature)
+        Stationary(self.atoms)
+        ZeroRotation(self.atoms)
+
+        timestep = self.config.get('timestep', 0.5) * units.fs
+        friction  = self.config.get('friction', 0.01)
+        dyn = Langevin(self.atoms, timestep=timestep,
+                       temperature_K=temperature, friction=friction)
+
+        ref_pos  = self.ref_positions
+        use_mic  = self.atoms.get_pbc().any()
+        cell     = self.atoms.get_cell()
+        pbc      = self.atoms.get_pbc()
+        msd_samples = []
+
+        def _sample_msd():
+            pos  = self.atoms.get_positions()
+            disp = pos - ref_pos
+            if use_mic:
+                disp, _ = find_mic(disp, cell, pbc)
+            # Mean squared displacement averaged over all atoms (scalar)
+            msd_samples.append(float(np.mean(np.sum(disp ** 2, axis=1))))
+
+        dyn.attach(_sample_msd, interval=kappa_sample_interval)
+
+        try:
+            dyn.run(kappa_fit_steps)
+        except Exception as exc:
+            self.atoms.calc = original_calc
+            self.logger.log(f"Kappa pre-run failed: {exc}", 'ERROR')
+            raise
+
+        self.atoms.calc = original_calc
+
+        if len(msd_samples) == 0:
+            raise RuntimeError("No MSD samples collected during kappa pre-run.")
+
+        mean_msd = float(np.mean(msd_samples))
+        kappa    = 3.0 * units.kB * temperature / mean_msd
+
+        self.logger.log(f"Samples collected    : {len(msd_samples)}")
+        self.logger.log(f"Mean atomic MSD      : {mean_msd:.6f} Ang^2")
+        self.logger.log(f"Fitted kappa         : {kappa:.6f} eV/Ang^2")
+        self.logger.log(f"Implied omega_E/sqrt(m): {np.sqrt(kappa):.4f} eV^0.5/Ang")
+
+        return kappa
+
+    def run_lambda_md(self, temperature: float, lambda_value: float,
+                      steps: int) -> Dict[str, Any]:
+        """
+        Run NVT MD at a fixed coupling parameter lambda (lambda-static TI).
+
+        The mixed Hamiltonian is:
+            Standard TI : U(lambda) = lambda*U_phys + (1-lambda)*U0
+            REG TI      : U(lambda) = lambda^m*U_phys + (1-lambda)^m*U0
+
+        Every ti_save_interval steps the following quantities are written
+        to a dedicated log file and stored in the returned dictionary:
+            Step | Time(ps) | E_phys | E0 | E_lambda | dH_dlambda | Temp | ForcesNorm
+
+        Parameters
+        ----------
+        temperature : float
+            NVT target temperature in Kelvin.
+        lambda_value : float
+            Coupling parameter in [0, 1].
+        steps : int
+            Total number of MD steps.
+
+        Returns
+        -------
+        traj_data : dict
+            Dictionary containing all logged quantities as lists, plus
+            metadata (kappa, mode, m, lambda_value).
+        """
+        ti_config        = self.config.get('thermodynamic_integration', {})
+        mode             = ti_config.get('mode', 'reg_ti')
+        m                = int(ti_config.get('m', 6))
+        ti_save_interval = int(ti_config.get('ti_save_interval', 20))
+
+        # Unique label used for filenames and cache keys
+        lam_str   = f"{lambda_value:.4f}".replace('.', 'p')
+        run_label = f"lambda{lam_str}_{int(temperature)}K"
+
+        # ------------------------------------------------------------------
+        # Cache check
+        # ------------------------------------------------------------------
+        cache_key = self.cache.get_cache_key(
+            {
+                'lambda_value': round(lambda_value, 8),
+                'temperature': temperature,
+                'mode': mode,
+                'm': m,
+                'steps': steps,
+                'timestep': self.config.get('timestep', 0.5),
+                'thermostat': self.config.get('thermostat', 'langevin'),
+                'ti_save_interval': ti_save_interval,
+                '_n_atoms': self.config.get('_n_atoms', 0),
+                '_cell': str(self.config.get('_cell', [])),
+            },
+            f"ti_{run_label}"
+        )
+
+        cached = self.cache.load_cache(cache_key)
+        if cached is not None:
+            self.logger.log(f"Loading TI trajectory from cache: "
+                            f"lambda={lambda_value:.4f}, {temperature} K")
+            return cached
+
+        # ------------------------------------------------------------------
+        # Pre-flight checks
+        # ------------------------------------------------------------------
+        self.logger.log_section(
+            f"LAMBDA-STATIC MD  lambda={lambda_value:.4f}  T={temperature} K  "
+            f"mode={mode}" + (f"  m={m}" if mode == 'reg_ti' else "")
+        )
+
+        if self.ref_positions is None:
+            raise RuntimeError(
+                "ref_positions is None.  Enable geo_opt: true in config so "
+                "that the geometry-optimised structure defines q0."
+            )
+        if self.ref_energy_at_q0 is None:
+            raise RuntimeError(
+                "ref_energy_at_q0 is None.  Run geometry optimisation first."
+            )
+
+        # ------------------------------------------------------------------
+        # Einstein spring constant
+        # ------------------------------------------------------------------
+        kappa = ti_config.get('einstein_kappa', None)
+        if kappa is None:
+            # Check whether a kappa was already fitted this session
+            kappa_cache_key = self.cache.get_cache_key(
+                {'temperature': temperature,
+                 '_n_atoms': self.config.get('_n_atoms', 0),
+                 '_cell': str(self.config.get('_cell', []))},
+                f"kappa_{int(temperature)}K"
+            )
+            kappa = self.cache.load_cache(kappa_cache_key)
+            if kappa is None:
+                kappa = self.fit_einstein_kappa(temperature)
+                self.cache.save_cache(kappa_cache_key, kappa,
+                                      f"Einstein kappa {temperature} K")
+            else:
+                self.logger.log(f"Loaded kappa from cache: {kappa:.6f} eV/Ang^2")
+        else:
+            self.logger.log(f"Using manual kappa = {kappa:.6f} eV/Ang^2 from config")
+
+        # ------------------------------------------------------------------
+        # Build mixed calculator
+        # ------------------------------------------------------------------
+        einstein_calc = EinsteinCrystalCalculator(
+            ref_positions=self.ref_positions,
+            kappa=kappa,
+            ref_energy=self.ref_energy_at_q0,
+            use_mic=bool(self.atoms.get_pbc().any()),
+        )
+
+        lambda_calc = LambdaCalculator(
+            phys_calc=self._calculator,
+            ref_calc=einstein_calc,
+            lambda_val=lambda_value,
+            mode=mode,
+            m=m,
+        )
+        self.atoms.calc = lambda_calc
+
+        # ------------------------------------------------------------------
+        # Initialise velocities
+        # ------------------------------------------------------------------
+        MaxwellBoltzmannDistribution(self.atoms, temperature_K=temperature)
+        Stationary(self.atoms)
+        ZeroRotation(self.atoms)
+
+        # ------------------------------------------------------------------
+        # Setup NVT integrator (Langevin recommended for TI; Nose-Hoover
+        # is also supported for better canonical sampling)
+        # ------------------------------------------------------------------
+        timestep  = self.config.get('timestep', 0.5) * units.fs
+        thermostat = self.config.get('thermostat', 'langevin').lower()
+        friction   = self.config.get('friction', 0.01)
+
+        if thermostat == 'langevin':
+            dyn = Langevin(self.atoms, timestep=timestep,
+                           temperature_K=temperature, friction=friction)
+            self.logger.log(f"Thermostat: Langevin  friction={friction}")
+        elif thermostat in ['nose-hoover', 'nosehover', 'nh']:
+            nh_tdamp  = self.config.get('nh_tdamp', 25.0) * units.fs
+            nh_tchain = self.config.get('nh_tchain', 3)
+            nh_tloop  = self.config.get('nh_tloop', 1)
+            dyn = NoseHooverChainNVT(
+                self.atoms, timestep=timestep, temperature_K=temperature,
+                tdamp=nh_tdamp, tchain=nh_tchain, tloop=nh_tloop
+            )
+            self.logger.log(f"Thermostat: Nose-Hoover  tdamp={nh_tdamp/units.fs:.1f} fs")
+        else:
+            self.logger.log(
+                f"Thermostat '{thermostat}' not supported for TI; "
+                "falling back to Langevin", 'WARNING'
+            )
+            dyn = Langevin(self.atoms, timestep=timestep,
+                           temperature_K=temperature, friction=friction)
+
+        # ------------------------------------------------------------------
+        # Log file
+        # ------------------------------------------------------------------
+        ti_traj_dir = self.output_dir / 'ti_trajectories'
+        ti_traj_dir.mkdir(exist_ok=True)
+        log_path = ti_traj_dir / f'ti_{run_label}.log'
+
+        traj_data: Dict[str, Any] = {
+            'lambda_value': lambda_value,
+            'temperature': temperature,
+            'mode': mode,
+            'm': m,
+            'kappa': kappa,
+            'ref_energy_at_q0': self.ref_energy_at_q0,
+            'times': [],
+            'e_phys': [],
+            'e0': [],
+            'e_lambda': [],
+            'dh_dlambda': [],
+            'temperatures': [],
+            'forces_norm': [],
+        }
+
+        step_counter = [0]
+
+        log_f = open(log_path, 'w')
+        log_f.write(f"# Lambda-Static MD Log  (amlpa.py + REG TI)\n")
+        log_f.write(f"# Reference: Kapil, J. Chem. Phys. 164, 051101 (2026)\n")
+        log_f.write(f"#\n")
+        log_f.write(f"# mode             : {mode}\n")
+        if mode == 'reg_ti':
+            log_f.write(f"# m                : {m}\n")
+            log_f.write(
+                f"# dH/dlambda formula: "
+                f"m * (lambda^(m-1) * E_phys - (1-lambda)^(m-1) * E0)\n"
+            )
+        else:
+            log_f.write(f"# dH/dlambda formula: E_phys - E0\n")
+        log_f.write(f"# lambda           : {lambda_value:.8f}\n")
+        log_f.write(f"# temperature      : {temperature} K\n")
+        log_f.write(f"# timestep         : {self.config.get('timestep', 0.5):.3f} fs\n")
+        log_f.write(f"# thermostat       : {thermostat}\n")
+        log_f.write(f"# total_steps      : {steps}\n")
+        log_f.write(f"# save_interval    : {ti_save_interval}\n")
+        log_f.write(f"# einstein_kappa   : {kappa:.8f} eV/Ang^2\n")
+        log_f.write(f"# ref_energy_U_q0  : {self.ref_energy_at_q0:.8f} eV\n")
+        log_f.write(f"# n_atoms          : {len(self.atoms)}\n")
+        log_f.write(f"#\n")
+        col_header = (
+            f"# {'Step':>10} {'Time(ps)':>12} {'E_phys(eV)':>16} "
+            f"{'E0(eV)':>16} {'E_lambda(eV)':>16} "
+            f"{'dH_dlambda(eV)':>18} {'Temp(K)':>10} {'FNorm(eV/A)':>13}\n"
+        )
+        log_f.write(col_header)
+        log_f.flush()
+
+        progress = tqdm(
+            total=steps,
+            desc=f"TI lambda={lambda_value:.3f} {temperature}K",
+            unit="steps"
+        )
+
+
+
+        def _log_frame():
+            """Callback attached to the integrator every ti_save_interval steps."""
+            current_time = dyn.get_time() / units.fs   # fs
+            current_temp = self.atoms.get_temperature()
+
+            # Read values stored by the last LambdaCalculator.calculate() call
+            e_phys     = lambda_calc.last_e_phys
+            e0         = lambda_calc.last_e0
+            e_lambda   = lambda_calc.last_e_lambda
+            dh_dlambda = lambda_calc.last_dh_dlambda
+            f_phys     = lambda_calc.last_forces_phys
+
+            if f_phys is not None:
+                forces_norm = float(np.sqrt(np.mean(np.sum(f_phys ** 2, axis=1))))
+            else:
+                forces_norm = 0.0
+
+            traj_data['times'].append(current_time)
+            traj_data['e_phys'].append(e_phys)
+            traj_data['e0'].append(e0)
+            traj_data['e_lambda'].append(e_lambda)
+            traj_data['dh_dlambda'].append(dh_dlambda)
+            traj_data['temperatures'].append(current_temp)
+            traj_data['forces_norm'].append(forces_norm)
+
+            log_f.write(
+                f"  {step_counter[0]:>10d} {current_time / 1000.0:>12.6f} "
+                f"{e_phys:>16.8f} {e0:>16.8f} {e_lambda:>16.8f} "
+                f"{dh_dlambda:>18.10f} {current_temp:>10.3f} {forces_norm:>13.8f}\n"
+            )
+            log_f.flush()
+
+            step_counter[0] += ti_save_interval
+            progress.update(ti_save_interval)
+
+        dyn.attach(_log_frame, interval=ti_save_interval)
+
+        # ------------------------------------------------------------------
+        # Run
+        # ------------------------------------------------------------------
+        try:
+            dyn.run(steps)
+            progress.close()
+
+            n_frames   = len(traj_data['dh_dlambda'])
+            mean_dh    = float(np.mean(traj_data['dh_dlambda']))
+            std_dh     = float(np.std(traj_data['dh_dlambda']))
+            mean_temp  = float(np.mean(traj_data['temperatures']))
+
+            log_f.write(f"\n# --- Summary ---\n")
+            log_f.write(f"# frames_collected   : {n_frames}\n")
+            log_f.write(f"# mean_dH_dlambda    : {mean_dh:.10f} eV\n")
+            log_f.write(f"# std_dH_dlambda     : {std_dh:.10f} eV\n")
+            log_f.write(f"# mean_temperature   : {mean_temp:.3f} K\n")
+            log_f.write(f"# target_temperature : {temperature} K\n")
+            log_f.close()
+
+            self.logger.log(
+                f"Lambda MD complete: {n_frames} frames  "
+                f"<dH/dlambda> = {mean_dh:.8f} +/- {std_dh:.8f} eV  "
+                f"<T> = {mean_temp:.1f} K"
+            )
+            self.logger.log(f"Log written: {log_path}")
+
+            # Cache
+            self.cache.save_cache(
+                cache_key, traj_data,
+                f"TI trajectory lambda={lambda_value:.4f} {temperature}K"
+            )
+
+            return traj_data
+
+        except Exception as exc:
+            progress.close()
+            log_f.write(f"\n# ERROR: {exc}\n")
+            log_f.close()
+            self.logger.log(f"Lambda MD failed: {exc}", 'ERROR')
+            import traceback
+            self.logger.log(traceback.format_exc(), 'ERROR')
+            raise
+
+        finally:
+            # Always restore the physical calculator on the atoms object
+            self.atoms.calc = self._calculator
 
     def analyze_rmsd(self, temperature: float = None) -> Dict[str, Any]:
         """Calculate RMSD between initial and current structure"""
@@ -2105,6 +2507,54 @@ class MDAnalyzer:
         else:
             self.logger.log_section("MD SIMULATIONS SKIPPED")
             self.logger.log("MD simulations disabled in configuration (run_md: false)")
+
+        # Thermodynamic Integration
+        ti_config = self.config.get('thermodynamic_integration', {})
+        if ti_config.get('enabled', False):
+            self.logger.log_section("THERMODYNAMIC INTEGRATION (LAMBDA-STATIC)")
+
+            ti_temperatures  = ti_config.get('temperatures',
+                                             self.config.get('temperatures', [300]))
+            lambda_values    = ti_config.get('lambda_values', [0.5])
+            ti_steps         = int(ti_config.get('md_steps_per_lambda',
+                                                 self.config.get('md_steps', 50000)))
+            equil_steps      = int(ti_config.get('equilibration_steps', 5000))
+            mode             = ti_config.get('mode', 'reg_ti')
+            m                = int(ti_config.get('m', 6))
+
+            self.logger.log(f"Mode            : {mode}" +
+                            (f"  m={m}" if mode == 'reg_ti' else ""))
+            self.logger.log(f"Lambda values   : {lambda_values}")
+            self.logger.log(f"Temperatures    : {ti_temperatures} K")
+            self.logger.log(f"Steps per lambda: {ti_steps}")
+            self.logger.log(f"Equilibration   : {equil_steps} steps "
+                            f"(discarded in ti_analysis.py)")
+
+            for temp in ti_temperatures:
+                for lam in lambda_values:
+                    try:
+                        traj = self.run_lambda_md(temp, float(lam), ti_steps)
+                        result_key = f"ti_lambda{lam:.4f}_{int(temp)}K"
+                        self.results[result_key] = {
+                            'lambda': float(lam),
+                            'temperature': float(temp),
+                            'mode': traj['mode'],
+                            'm': traj['m'],
+                            'kappa_eV_Ang2': float(traj['kappa']),
+                            'ref_energy_at_q0_eV': float(traj['ref_energy_at_q0']),
+                            'n_frames': len(traj['dh_dlambda']),
+                            'mean_dh_dlambda_eV': float(np.mean(traj['dh_dlambda'])),
+                            'std_dh_dlambda_eV': float(np.std(traj['dh_dlambda'])),
+                            'mean_temperature_K': float(np.mean(traj['temperatures'])),
+                        }
+                    except Exception as exc:
+                        self.logger.log(
+                            f"TI run failed lambda={lam} T={temp}K: {exc}", 'ERROR'
+                        )
+        else:
+            self.logger.log("Thermodynamic integration disabled (set enabled: true to run)")
+
+
         # Print cache statistics
         self.logger.log_section("CACHE STATISTICS")
         self.cache.print_cache_summary(self.logger)
@@ -2140,6 +2590,184 @@ class MDAnalyzer:
             return obj.item()
         else:
             return obj
+
+class EinsteinCrystalCalculator(Calculator):
+    """
+    Einstein crystal reference potential for Thermodynamic Integration.
+
+    U0(q) = U(q0) + (kappa/2) * sum_i |r_i - r0_i|^2
+
+    Forces:
+        F0_i = -kappa * (r_i - r0_i)
+
+    The static offset U(q0) is the MACE energy at the geometry-optimised
+    structure, ensuring the two potentials coincide exactly at the reference
+    point and avoiding any discontinuity.  Displacements are computed using
+    the minimum-image convention (MIC) when PBC are active.
+
+    Parameters
+    ----------
+    ref_positions : np.ndarray, shape (N, 3)
+        Equilibrium positions q0 (Angstrom).
+    kappa : float
+        Harmonic spring constant (eV/Ang^2).  Positive value.
+    ref_energy : float
+        Potential energy of the physical system at q0, U(q0), in eV.
+        Defaults to 0.0 (only correct for free-energy differences where
+        the offset cancels; set properly for absolute free energies).
+    use_mic : bool
+        Apply minimum-image convention for PBC.  Automatically set to
+        True when atoms have any periodic boundary condition active.
+    """
+
+    implemented_properties = ['energy', 'forces']
+
+    def __init__(self, ref_positions: np.ndarray, kappa: float,
+                 ref_energy: float = 0.0, use_mic: bool = True, **kwargs):
+        super().__init__(**kwargs)
+        self.ref_positions = ref_positions.copy()
+        self.kappa = float(kappa)
+        self.ref_energy = float(ref_energy)
+        self.use_mic = use_mic
+
+    def calculate(self, atoms=None, properties=None,
+                  system_changes=all_changes):
+        if properties is None:
+            properties = ['energy', 'forces']
+        super().calculate(atoms, properties, system_changes)
+
+        positions = self.atoms.get_positions()
+        disp = positions - self.ref_positions          # shape (N, 3)
+
+        if self.use_mic and self.atoms.get_pbc().any():
+            disp, _ = find_mic(disp, self.atoms.get_cell(), self.atoms.get_pbc())
+
+        energy = self.ref_energy + 0.5 * self.kappa * float(np.sum(disp ** 2))
+        forces = -self.kappa * disp                    # shape (N, 3)
+
+        self.results = {
+            'energy': energy,
+            'forces': forces,
+        }
+
+
+class LambdaCalculator(Calculator):
+    """
+    Mixed Hamiltonian for lambda-static Thermodynamic Integration.
+
+    Standard TI  (Kirkwood 1935):
+        U(lambda) = lambda * U_phys + (1 - lambda) * U0
+        dU/dlambda = U_phys - U0
+
+    REG TI  (Kapil, J. Chem. Phys. 164, 051101, 2026, Eq. 7-8):
+        f(lambda) = lambda^m,   g(lambda) = (1 - lambda)^m   (m integer > 1)
+        U(lambda) = lambda^m * U_phys + (1 - lambda)^m * U0
+        dU/dlambda = m * [lambda^(m-1) * U_phys - (1 - lambda)^(m-1) * U0]
+
+    Forces are mixed with the same coefficients as energies:
+        F(lambda) = c_phys * F_phys + c_ref * F0
+
+    The last computed values of E_phys, E0, E_lambda, dH_dlambda and
+    F_phys are stored as instance attributes so the MD logging callback
+    can read them without triggering an additional force evaluation.
+
+    Parameters
+    ----------
+    phys_calc : ASE Calculator
+        Physical potential (e.g. MACECalculator).  Must already be
+        attached to the atoms object before the MD run begins.
+    ref_calc : EinsteinCrystalCalculator
+        Reference harmonic potential.
+    lambda_val : float
+        Coupling parameter in [0, 1].  lambda=0 is pure Einstein
+        crystal; lambda=1 is the physical potential.
+    mode : str
+        'reg_ti'  (default, recommended) or 'standard_ti'.
+    m : int
+        REG TI exponent.  Paper recommends m=6.  Ignored for standard_ti.
+    """
+
+    implemented_properties = ['energy', 'forces']
+
+    def __init__(self, phys_calc, ref_calc, lambda_val: float,
+                 mode: str = 'reg_ti', m: int = 6, **kwargs):
+        super().__init__(**kwargs)
+        self.phys_calc = phys_calc
+        self.ref_calc = ref_calc
+        self.lambda_val = float(lambda_val)
+        self.mode = mode
+        self.m = int(m)
+
+        # Storage — populated on every calculate() call; read by log callback
+        self.last_e_phys = None
+        self.last_e0 = None
+        self.last_e_lambda = None
+        self.last_dh_dlambda = None
+        self.last_forces_phys = None
+
+    def _mixing_coefficients(self) -> Tuple[float, float, float, float]:
+        """
+        Return (c_phys, c_ref, dc_phys, dc_ref) where:
+            U(lambda) = c_phys * U_phys + c_ref * U0
+            dU/dlambda = dc_phys * U_phys + dc_ref * U0
+        """
+        lam = self.lambda_val
+        m = self.m
+
+        if self.mode == 'standard_ti':
+            c_phys  = lam
+            c_ref   = 1.0 - lam
+            dc_phys = 1.0
+            dc_ref  = -1.0
+        else:
+            # REG TI — Eq. (8) of Kapil 2026
+            c_phys  = lam ** m
+            c_ref   = (1.0 - lam) ** m
+            # Derivative coefficients — handle exact endpoints to avoid 0^negative
+            dc_phys = m * (lam ** (m - 1)) if lam > 0.0 else 0.0
+            dc_ref  = -m * ((1.0 - lam) ** (m - 1)) if lam < 1.0 else 0.0
+
+        return c_phys, c_ref, dc_phys, dc_ref
+
+    def calculate(self, atoms=None, properties=None,
+                  system_changes=all_changes):
+        if properties is None:
+            properties = ['energy', 'forces']
+        super().calculate(atoms, properties, system_changes)
+
+        c_phys, c_ref, dc_phys, dc_ref = self._mixing_coefficients()
+
+        # --- Physical potential ---
+        self.phys_calc.calculate(self.atoms, properties, system_changes)
+        e_phys = float(self.phys_calc.results['energy'])
+        f_phys = self.phys_calc.results['forces'].copy()
+
+        # --- Reference (Einstein crystal) potential ---
+        self.ref_calc.calculate(self.atoms, properties, system_changes)
+        e0 = float(self.ref_calc.results['energy'])
+        f0 = self.ref_calc.results['forces'].copy()
+
+        # --- Mixed energy and forces ---
+        e_lambda = c_phys * e_phys + c_ref * e0
+        f_lambda = c_phys * f_phys + c_ref * f0
+
+        # --- TI integrand: dH/dlambda at this configuration ---
+        dh_dlambda = dc_phys * e_phys + dc_ref * e0
+
+        # Store for logging (no extra force evaluation needed)
+        self.last_e_phys = e_phys
+        self.last_e0 = e0
+        self.last_e_lambda = e_lambda
+        self.last_dh_dlambda = dh_dlambda
+        self.last_forces_phys = f_phys
+
+        self.results = {
+            'energy': e_lambda,
+            'forces': f_lambda,
+        }
+
+
+
 
 def main():
     """Main execution function"""
