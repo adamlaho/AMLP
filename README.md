@@ -337,7 +337,6 @@ nh_tloop: 1           # Sub-steps (higher = more accurate but slower)
 energy_drift_start_time_ps: 0.1  # Skip initial equilibration (ps) only for NVE
 
 ```
----
 
 ### Thermodynamic Integration (Lambda-Static TI)
 
