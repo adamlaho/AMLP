@@ -337,6 +337,76 @@ nh_tloop: 1           # Sub-steps (higher = more accurate but slower)
 energy_drift_start_time_ps: 0.1  # Skip initial equilibration (ps) only for NVE
 
 ```
+---
+
+### Thermodynamic Integration (Lambda-Static TI)
+
+Computes free energy differences between the physical MACE potential and an Einstein crystal reference via lambda-static TI.
+
+#### Coupling Schemes
+
+**Standard TI** (Kirkwood 1935):
+$$U(\lambda) = \lambda\,U_\text{phys} + (1-\lambda)\,U_0, \qquad \frac{\partial U}{\partial\lambda} = U_\text{phys} - U_0$$
+
+**REG TI** — default (Kapil, *J. Chem. Phys.* **164**, 051101, 2026):
+$$U(\lambda) = \lambda^m U_\text{phys} + (1-\lambda)^m U_0, \qquad \frac{\partial U}{\partial\lambda} = m\!\left[\lambda^{m-1}U_\text{phys} - (1-\lambda)^{m-1}U_0\right]$$
+
+#### Einstein Crystal Reference
+
+The reference is a harmonic potential anchored at the geometry-optimised structure $\mathbf{q}_0$:
+$$U_0(\mathbf{q}) = U(\mathbf{q}_0) + \frac{\kappa}{2}\sum_i|\mathbf{r}_i - \mathbf{r}_i^0|^2$$
+
+The offset $U(\mathbf{q}_0)$ ensures both potentials coincide at the reference geometry. MIC is applied when PBC are active.
+
+> **Prerequisite:** `geo_opt: true` must be enabled so that $\mathbf{q}_0$ is defined before any TI run.
+
+If `einstein_kappa` is not set manually, it is auto-fitted from a short NVT pre-run via equipartition:
+$$\kappa = \frac{3k_\text{B}T}{\langle|\mathbf{r}_i - \mathbf{r}_i^0|^2\rangle}$$
+
+The fitted $\kappa$ is cached and reused for all $\lambda$ windows at the same temperature.
+
+#### Configuration
+
+```yaml
+thermodynamic_integration:
+  enabled: true
+
+  mode: 'reg_ti'           # 'reg_ti' (recommended) or 'standard_ti'
+  m: 6                     # REG TI exponent
+
+  lambda_values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  temperatures: [300]      # K
+
+  md_steps_per_lambda: 50000    # Production steps per window
+  equilibration_steps: 5000     # Discarded in post-processing (ti_analysis.py)
+  ti_save_interval: 20          # Logging frequency (steps)
+
+  # einstein_kappa: 2.5         # eV/Å² — leave unset to auto-fit (recommended)
+  kappa_fit_steps: 2000
+  kappa_sample_interval: 10
+```
+
+The thermostat is set via the top-level `thermostat` key.
+
+#### Output
+
+Each window writes a log to `results/ti_trajectories/ti_lambda<X.XXXX>_<T>K.log` with columns:
+
+| Column | Description |
+|---|---|
+| `Step` / `Time(ps)` | MD step and simulation time |
+| `E_phys` / `E0` | Physical and Einstein crystal energies (eV) |
+| `E_lambda` | Mixed Hamiltonian energy (eV) |
+| `dH_dlambda` | TI integrand $\partial U/\partial\lambda$ (eV) |
+| `Temp(K)` / `FNorm` | Instantaneous temperature and RMS force norm |
+
+Mean and std of $\langle\partial U/\partial\lambda\rangle$ are appended as a summary at the end of each log. Integration over $\lambda$ to obtain $\Delta F$ is performed by `ti_analysis.py`.
+
+#### Caching
+
+Each $\lambda$ window is cached independently. Re-running with identical parameters (structure, `lambda_values`, `temperatures`, `md_steps_per_lambda`, `mode`, `m`) loads results from cache, skipping the MD entirely. The fitted $\kappa$ is also cached per temperature.
+
+
 ##### 📈 Radial Distribution Function Analysis settings
 RDF uses the SIMULATION cell 
 - Cutoff is automatically validated: rmax <= 0.5 * min(cell_length)
