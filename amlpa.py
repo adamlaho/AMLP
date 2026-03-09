@@ -223,6 +223,8 @@ class MDAnalyzer:
         self.simulation_cell_replicated = False
         self.ref_positions = None 
         self.ref_energy_at_q0 = None 
+        # Lazily-built intramolecular FF calculator, shared across all lambda values
+        self._intramol_calc: Optional['IntramolecularFFCalculator'] = None
         
     def _load_config(self, config_file: str) -> dict:
         """Load configuration from YAML file"""
@@ -874,6 +876,73 @@ class MDAnalyzer:
 
         return kappa
 
+    def _build_intramol_calc(self, ti_config: dict):
+        """
+        Lazily build and cache IntramolecularFFCalculator.
+
+        Called at most once per MDAnalyzer session.  The calculator is
+        stored as self._intramol_calc and reused across all lambda values
+        and temperatures (the intramolecular topology does not change).
+
+        Returns None if intramolecular_ff.enabled is False or absent.
+        """
+        intramol_cfg = ti_config.get('intramolecular_ff', {})
+        if not intramol_cfg.get('enabled', False):
+            return None
+
+        if self._intramol_calc is not None:
+            self.logger.log("Reusing cached IntramolecularFFCalculator.")
+            return self._intramol_calc
+
+        self.logger.log_section("INTRAMOLECULAR FF SETUP")
+        ff_type = intramol_cfg.get('ff_type', 'gaff2')
+        self.logger.log(f"Force field type    : {ff_type}")
+        self.logger.log(f"Number of molecules : {intramol_cfg.get('n_molecules', 1)}")
+        self.logger.log(f"Zero at reference   : {intramol_cfg.get('zero_at_reference', True)}")
+
+        if self.ref_positions is None:
+            raise RuntimeError(
+                "ref_positions is None.  Run geometry optimisation "
+                "(geo_opt: true) before enabling intramolecular_ff."
+            )
+
+        try:
+            # Pass the pre-replication primitive cell so that
+            # _unwrap_positions_for_openmm can search over integer multiples of
+            # the original lattice vectors.  For a [1,ny,nz] supercell, bonds
+            # crossing the original unit-cell boundary need corrections of
+            # ±c_orig = ±c_super/nz — a half-integer of the supercell vector —
+            # which only integer multiples of the primitive vectors can recover.
+            prim_cell = (
+                self.initial_atoms.get_cell()
+                if self.initial_atoms is not None
+                else None
+            )
+            fix_hbonds = intramol_cfg.get('fix_hbonds', False)
+            self.logger.log(f"Fix X-H bonds       : {fix_hbonds}")
+            calc = IntramolecularFFCalculator(
+                atoms                = self.atoms,
+                ff_type              = ff_type,
+                mol_smiles           = intramol_cfg.get('mol_smiles', None),
+                mol_sdf_file         = intramol_cfg.get('mol_sdf_file', None),
+                n_molecules          = intramol_cfg.get('n_molecules', 1),
+                n_atoms_per_molecule = intramol_cfg.get('n_atoms_per_molecule', None),
+                ref_positions        = self.ref_positions,
+                zero_at_reference    = intramol_cfg.get('zero_at_reference', True),
+                openmm_platform      = intramol_cfg.get('openmm_platform', 'CUDA'),
+                prim_cell            = prim_cell,
+                fix_hbonds           = fix_hbonds,
+            )
+            self.logger.log(f"IntramolecularFFCalculator ready  [platform: {calc._platform_name}]")
+            self.logger.log(f"Energy shift ΔU(q0): {calc._ref_energy_shift:.6f} eV")
+            self._intramol_calc = calc
+            return calc
+        except Exception as exc:
+            self.logger.log(f"Failed to build IntramolecularFFCalculator: {exc}", 'ERROR')
+            import traceback
+            self.logger.log(traceback.format_exc(), 'ERROR')
+            raise
+
     def run_lambda_md(self, temperature: float, lambda_value: float,
                       steps: int) -> Dict[str, Any]:
         """
@@ -886,6 +955,11 @@ class MDAnalyzer:
         Every ti_save_interval steps the following quantities are written
         to a dedicated log file and stored in the returned dictionary:
             Step | Time(ps) | E_phys | E0 | E_lambda | dH_dlambda | Temp | ForcesNorm
+
+        Trajectory saving is controlled by ``ti_save_trajectory`` in the
+        ``thermodynamic_integration`` config block (default: false).
+        When enabled, each sampled frame is appended to an XYZ file named
+        ``ti_trajectories/ti_<label>.xyz`` alongside the log file.
 
         Parameters
         ----------
@@ -906,6 +980,8 @@ class MDAnalyzer:
         mode             = ti_config.get('mode', 'reg_ti')
         m                = int(ti_config.get('m', 6))
         ti_save_interval = int(ti_config.get('ti_save_interval', 20))
+        # Whether to write an XYZ trajectory alongside the TI log
+        ti_save_trajectory = bool(ti_config.get('ti_save_trajectory', False))
 
         # Unique label used for filenames and cache keys
         lam_str   = f"{lambda_value:.4f}".replace('.', 'p')
@@ -914,18 +990,28 @@ class MDAnalyzer:
         # ------------------------------------------------------------------
         # Cache check
         # ------------------------------------------------------------------
+        intramol_cfg     = ti_config.get('intramolecular_ff', {})
+        intramol_enabled = intramol_cfg.get('enabled', False)
+
         cache_key = self.cache.get_cache_key(
             {
-                'lambda_value': round(lambda_value, 8),
-                'temperature': temperature,
-                'mode': mode,
-                'm': m,
-                'steps': steps,
-                'timestep': self.config.get('timestep', 0.5),
-                'thermostat': self.config.get('thermostat', 'langevin'),
+                'lambda_value'    : round(lambda_value, 8),
+                'temperature'     : temperature,
+                'mode'            : mode,
+                'm'               : m,
+                'steps'           : steps,
+                'timestep'        : self.config.get('timestep', 0.5),
+                'thermostat'      : self.config.get('thermostat', 'langevin'),
                 'ti_save_interval': ti_save_interval,
-                '_n_atoms': self.config.get('_n_atoms', 0),
-                '_cell': str(self.config.get('_cell', [])),
+                '_n_atoms'        : self.config.get('_n_atoms', 0),
+                '_cell'           : str(self.config.get('_cell', [])),
+                # intramol FF fingerprint — cache is invalidated when reference changes
+                'intramol_enabled': intramol_enabled,
+                'intramol_ff_type': intramol_cfg.get('ff_type', 'none'),
+                'intramol_smiles' : intramol_cfg.get('mol_smiles', ''),
+                'intramol_sdf'    : intramol_cfg.get('mol_sdf_file', ''),
+                'intramol_n_mol'  : intramol_cfg.get('n_molecules', 1),
+                'intramol_zero'   : intramol_cfg.get('zero_at_reference', True),
             },
             f"ti_{run_label}"
         )
@@ -977,7 +1063,9 @@ class MDAnalyzer:
             self.logger.log(f"Using manual kappa = {kappa:.6f} eV/Ang^2 from config")
 
         # ------------------------------------------------------------------
-        # Build mixed calculator
+        # Build reference calculator
+        #   Option A (default):  pure Einstein crystal
+        #   Option B (enabled):  Einstein crystal + intramolecular FF
         # ------------------------------------------------------------------
         einstein_calc = EinsteinCrystalCalculator(
             ref_positions=self.ref_positions,
@@ -986,9 +1074,22 @@ class MDAnalyzer:
             use_mic=bool(self.atoms.get_pbc().any()),
         )
 
+        if intramol_enabled:
+            intramol_calc  = self._build_intramol_calc(ti_config)
+            ref_calc       = CombinedReferenceCalculator(einstein_calc, intramol_calc)
+            ref_state_label = (
+                f"Einstein crystal + {intramol_cfg.get('ff_type','gaff2').upper()} "
+                f"intramolecular FF  (ΔU_shift={intramol_calc._ref_energy_shift:.4f} eV)"
+            )
+        else:
+            ref_calc        = einstein_calc
+            ref_state_label = "Einstein crystal only (no intramolecular FF)"
+
+        self.logger.log(f"Reference state: {ref_state_label}")
+
         lambda_calc = LambdaCalculator(
             phys_calc=self._calculator,
-            ref_calc=einstein_calc,
+            ref_calc=ref_calc,
             lambda_val=lambda_value,
             mode=mode,
             m=m,
@@ -1032,19 +1133,33 @@ class MDAnalyzer:
                            temperature_K=temperature, friction=friction)
 
         # ------------------------------------------------------------------
-        # Log file
+        # Output paths
         # ------------------------------------------------------------------
         ti_traj_dir = self.output_dir / 'ti_trajectories'
         ti_traj_dir.mkdir(exist_ok=True)
-        log_path = ti_traj_dir / f'ti_{run_label}.log'
+        log_path  = ti_traj_dir / f'ti_{run_label}.log'
+        traj_path = ti_traj_dir / f'ti_{run_label}.xyz' if ti_save_trajectory else None
 
+        if ti_save_trajectory:
+            self.logger.log(f"TI trajectory saving enabled: {traj_path}")
+            # Remove stale file from a previous (non-cached) run
+            if traj_path.exists():
+                traj_path.unlink()
+        else:
+            self.logger.log("TI trajectory saving disabled (ti_save_trajectory: false)")
+
+        # ------------------------------------------------------------------
+        # In-memory data store
+        # ------------------------------------------------------------------
         traj_data: Dict[str, Any] = {
-            'lambda_value': lambda_value,
-            'temperature': temperature,
-            'mode': mode,
-            'm': m,
-            'kappa': kappa,
-            'ref_energy_at_q0': self.ref_energy_at_q0,
+            'lambda_value'     : lambda_value,
+            'temperature'      : temperature,
+            'mode'             : mode,
+            'm'                : m,
+            'kappa'            : kappa,
+            'ref_energy_at_q0' : self.ref_energy_at_q0,
+            'intramol_ff_used' : intramol_enabled,
+            'ref_state_label'  : ref_state_label,
             'times': [],
             'e_phys': [],
             'e0': [],
@@ -1060,6 +1175,7 @@ class MDAnalyzer:
         log_f.write(f"# Lambda-Static MD Log  (amlpa.py + REG TI)\n")
         log_f.write(f"# Reference: Kapil, J. Chem. Phys. 164, 051101 (2026)\n")
         log_f.write(f"#\n")
+        log_f.write(f"# reference_state  : {ref_state_label}\n")
         log_f.write(f"# mode             : {mode}\n")
         if mode == 'reg_ti':
             log_f.write(f"# m                : {m}\n")
@@ -1069,12 +1185,16 @@ class MDAnalyzer:
             )
         else:
             log_f.write(f"# dH/dlambda formula: E_phys - E0\n")
+        if intramol_enabled:
+            log_f.write(f"# intramol_ff_type : {intramol_cfg.get('ff_type','gaff2')}\n")
+            log_f.write(f"# intramol_U_shift : {self._intramol_calc._ref_energy_shift:.8f} eV\n")
         log_f.write(f"# lambda           : {lambda_value:.8f}\n")
         log_f.write(f"# temperature      : {temperature} K\n")
         log_f.write(f"# timestep         : {self.config.get('timestep', 0.5):.3f} fs\n")
         log_f.write(f"# thermostat       : {thermostat}\n")
         log_f.write(f"# total_steps      : {steps}\n")
         log_f.write(f"# save_interval    : {ti_save_interval}\n")
+        log_f.write(f"# save_trajectory  : {ti_save_trajectory}\n")
         log_f.write(f"# einstein_kappa   : {kappa:.8f} eV/Ang^2\n")
         log_f.write(f"# ref_energy_U_q0  : {self.ref_energy_at_q0:.8f} eV\n")
         log_f.write(f"# n_atoms          : {len(self.atoms)}\n")
@@ -1092,8 +1212,6 @@ class MDAnalyzer:
             desc=f"TI lambda={lambda_value:.3f} {temperature}K",
             unit="steps"
         )
-
-
 
         def _log_frame():
             """Callback attached to the integrator every ti_save_interval steps."""
@@ -1127,6 +1245,10 @@ class MDAnalyzer:
             )
             log_f.flush()
 
+            # Optionally save the current frame to an XYZ trajectory
+            if ti_save_trajectory and traj_path is not None:
+                write(str(traj_path), self.atoms, append=True)
+
             step_counter[0] += ti_save_interval
             progress.update(ti_save_interval)
 
@@ -1158,6 +1280,10 @@ class MDAnalyzer:
                 f"<T> = {mean_temp:.1f} K"
             )
             self.logger.log(f"Log written: {log_path}")
+            if ti_save_trajectory and traj_path is not None:
+                self.logger.log(f"Trajectory written: {traj_path}")
+            else:
+                self.logger.log("Trajectory saving disabled (ti_save_trajectory: false)")
 
             # Cache
             self.cache.save_cache(
@@ -2492,7 +2618,7 @@ class MDAnalyzer:
                         self.plot_energy_drift(temp)
                     
                     # RDF analysis
-                    if self.config.get('run_rdf', False):  # ← ADD THIS CHECK
+                    if self.config.get('run_rdf', False):
                         rdf_results = self.analyze_rdf_from_trajectory(temp)
                         if rdf_results:
                             self.results[f'rdf_{temp}K'] = rdf_results
@@ -2502,7 +2628,7 @@ class MDAnalyzer:
                     if fe_results:
                         self.results[f'free_energy_{temp}K'] = fe_results
             # Generate comparison plots
-            if self.config.get('run_rdf', False):  # ← ADD THIS CHECK
+            if self.config.get('run_rdf', False):
                 self.plot_rdf_comparison()
         else:
             self.logger.log_section("MD SIMULATIONS SKIPPED")
@@ -2590,6 +2716,890 @@ class MDAnalyzer:
             return obj.item()
         else:
             return obj
+
+# =============================================================================
+# INTRAMOLECULAR FORCE FIELD CALCULATORS FOR TI REFERENCE STATE
+# =============================================================================
+
+class IntramolecularFFCalculator(Calculator):
+    """
+    ASE Calculator that evaluates ONLY intramolecular energy / forces
+    (bonds, angles, proper + improper torsions, and 1-4 scaled nonbonded)
+    using GAFF-2 or OPLS-AA via OpenMM.
+
+    All intermolecular nonbonded interactions are removed from the OpenMM
+    system, so this term can safely be added to the Einstein crystal
+    reference without introducing spurious intermolecular contributions.
+
+    Motivation
+    ----------
+    The pure Einstein crystal has no intramolecular potential.  At λ=0
+    molecules can freely deform, causing the integrand <∂H/∂λ> to reach
+    ~300 kJ/mol per atom vs the ~0-10 kJ/mol polymorph signal.
+    Adding an intramolecular FF to the reference state:
+
+      1. Prevents molecular deformation at all λ values.
+      2. Dramatically reduces ∫ <∂H/∂λ> dλ.
+      3. Reduces statistical uncertainty in ΔF_anh.
+
+    Modified reference Hamiltonian::
+
+        U_ref(q) = U_einstein(q)  +  ΔU_intramol(q)
+
+    where  ΔU_intramol(q) = U_FF(q) - U_FF(q0)  so that U_ref(q0) = U_MACE(q0).
+
+    YAML configuration example
+    --------------------------
+    .. code-block:: yaml
+
+        thermodynamic_integration:
+          enabled: true
+          intramolecular_ff:
+            enabled: true
+            ff_type: gaff2                  # gaff2 | gaff | opls | openff-2.2.1
+            mol_smiles: "NC(=O)c1ccccc1"   # SMILES for ONE molecule
+            # mol_sdf_file: "mol.sdf"       # alternative to mol_smiles
+            n_molecules: 16                 # molecules in the cell
+            n_atoms_per_molecule: 15        # optional, for validation
+            zero_at_reference: true         # shift so ΔU(q0) = 0 (recommended)
+            fix_hbonds: false               # true → constrain X-H bonds, remove
+                                            #   their stretching from energy/forces.
+                                            #   Eliminates high-frequency H-stretch
+                                            #   noise from the TI integrand.
+            openmm_platform: CUDA
+
+    Parameters
+    ----------
+    atoms : ase.Atoms
+        Full simulation cell.
+    ff_type : str
+        Force field: 'gaff2' (default), 'gaff', or 'opls'.
+    mol_smiles : str, optional
+        SMILES of **one** molecule.
+    mol_sdf_file : str, optional
+        Path to SDF file for **one** molecule.
+    n_molecules : int
+        Number of identical molecules in the cell.
+    n_atoms_per_molecule : int, optional
+        Atoms per molecule – used for input validation only.
+    ref_positions : np.ndarray (N, 3), optional
+        Reference positions q0 in Angstrom.  Required when zero_at_reference=True.
+    zero_at_reference : bool
+        Subtract U_FF(q0) so ΔU_intramol(q0) = 0 (strongly recommended).
+    openmm_platform : str
+        OpenMM platform preference.  Falls back to CPU automatically.
+    fix_hbonds : bool
+        If True, constrain all X-H bonds at their equilibrium lengths and
+        set their HarmonicBondForce constants to zero.  X-H stretches are
+        high-frequency (> 3000 cm⁻¹) and classically over-sampled; removing
+        them from the intramolecular reference reduces noise in the TI
+        integrand without significantly changing the anharmonic free energy.
+        Default: False (include all bonded terms).
+    """
+
+    implemented_properties = ['energy', 'forces']
+
+    # Unit conversion: OpenMM → ASE
+    # 1 eV = 96.4853 kJ/mol  |  1 nm = 10 Å
+    _KJ_MOL_TO_EV = 1.0 / 96.4853          # energy
+    _FORCE_CONV   = _KJ_MOL_TO_EV / 10.0   # kJ/(mol·nm) → eV/Å
+
+    def __init__(self, atoms,
+                 ff_type='gaff2',
+                 mol_smiles=None,
+                 mol_sdf_file=None,
+                 n_molecules=1,
+                 n_atoms_per_molecule=None,
+                 ref_positions=None,
+                 zero_at_reference=True,
+                 openmm_platform='CUDA',
+                 prim_cell=None,
+                 fix_hbonds=False,
+                 **kwargs):
+        super().__init__(**kwargs)
+
+        self.ff_type           = ff_type.lower()
+        self.n_molecules       = int(n_molecules)
+        self.n_atoms_total     = len(atoms)
+        self.zero_at_reference = zero_at_reference
+        self._ref_energy_shift = 0.0
+        # When True, all X-H bond stretching terms are removed from the
+        # HarmonicBondForce and replaced with rigid constraints.  This
+        # eliminates the high-frequency H-stretch contribution from the
+        # intramolecular FF energy and the TI integrand.
+        self.fix_hbonds        = bool(fix_hbonds)
+
+        if n_atoms_per_molecule is not None:
+            expected = n_atoms_per_molecule * self.n_molecules
+            if expected != self.n_atoms_total:
+                raise ValueError(
+                    f"n_atoms_per_molecule * n_molecules = {expected} "
+                    f"but len(atoms) = {self.n_atoms_total}"
+                )
+
+        # Store cell and PBC for position unwrapping on every OpenMM call.
+        # Crystal positions are wrapped — molecules straddling periodic
+        # boundaries have bonds that appear ~10 Å long to OpenMM bonded forces.
+        self._cell = np.array(atoms.get_cell())  # (3,3) supercell
+        self._pbc  = atoms.get_pbc()
+        # Primitive (pre-replication) cell used for BFS image search.
+        # For a supercell created by repeat([nx,ny,nz]), a bond crossing the
+        # original unit-cell boundary has a correction that is a half-integer
+        # multiple of the supercell vector — unreachable by integer MIC on the
+        # supercell.  Using the primitive cell vectors directly solves this.
+        self._prim_cell = np.array(prim_cell) if prim_cell is not None else self._cell
+
+        self._build_omm_system(atoms, mol_smiles, mol_sdf_file, openmm_platform)
+
+        if zero_at_reference and ref_positions is not None:
+            self._ref_energy_shift = self._eval_energy_only(ref_positions)
+
+    # ------------------------------------------------------------------
+    # OpenMM system construction
+    # ------------------------------------------------------------------
+
+
+    def _build_omm_system(self, atoms, mol_smiles, mol_sdf_file, platform_name):
+        """Build the intramolecular-only OpenMM Context."""
+        import openmm as mm
+        import numpy as np
+        import logging
+        log = logging.getLogger(__name__)
+
+        _OPENFF_TYPES = ('gaff2', 'gaff', 'openff-2.2.1', 'openff-2.2.0',
+                         'openff-2.1.1', 'openff-2.1.0')
+
+        if self.ff_type in _OPENFF_TYPES:
+            omm_system, off_mol = self._setup_gaff(mol_smiles, mol_sdf_file)
+        elif self.ff_type in ('opls', 'opls-aa', 'opls_aa'):
+            omm_system = self._setup_opls(mol_smiles, mol_sdf_file)
+            off_mol    = None
+        else:
+            raise ValueError(
+                f"Unknown ff_type '{self.ff_type}'. "
+                f"Supported: {_OPENFF_TYPES + ('opls', 'opls-aa', 'opls_aa')}"
+            )
+
+        # ------------------------------------------------------------------
+        # Build ff_to_crystal permutation.
+        #
+        # Crystal supercell atoms are NOT stored molecule-contiguously after
+        # ASE make_supercell (element-grouped). We must:
+        #  1. Find connected molecules via PBC-aware NeighborList → G_crys.
+        #  2. Use graph isomorphism on a subgraph of G_crys (one molecule)
+        #     vs G_ff to get a local permutation.
+        #  3. Apply to all molecules.
+        # ------------------------------------------------------------------
+        if off_mol is not None:
+            try:
+                # Step 1: build full PBC-aware bond graph once
+                n_per  = self.n_atoms_total // self.n_molecules
+                G_crys = self._build_crystal_graph(atoms)
+
+                # Step 2: find connected molecular components
+                import networkx as nx
+                components = sorted(
+                    [sorted(c) for c in nx.connected_components(G_crys)],
+                    key=lambda c: c[0]
+                )
+                bad = [c for c in components if len(c) != n_per]
+                if bad:
+                    sizes = sorted({len(c) for c in components})
+                    raise ValueError(
+                        f"Expected all molecules to have {n_per} atoms, "
+                        f"found sizes {sizes}. Check n_molecules in config."
+                    )
+                if len(components) != self.n_molecules:
+                    raise ValueError(
+                        f"Found {len(components)} molecules but "
+                        f"n_molecules={self.n_molecules}."
+                    )
+                log.info(f"Found {len(components)} molecules of {n_per} atoms each.")
+
+                # Steps 3+4: compute permutation independently for each molecule.
+                # In P21/c (Z=4) the four molecules have symmetry-distinct orientations
+                # (identity, 2_1-screw, inversion, c-glide). A molecule with C2v symmetry
+                # (e.g. acridine) has exactly 2 valid graph isomorphisms — molecule vs
+                # its mirror image. Using molecule 0's isomorphism for all molecules maps
+                # the wrong atom pairs as "bonded" for orientations that need the other
+                # isomorphism, producing garbage G_topo edges and 7+ Å unwrap bonds.
+                # _compute_ff_to_crystal_perm selects the best isomorphism by RMSD
+                # against the actual crystal geometry of each molecule independently.
+                self._ff_to_crystal = np.empty(self.n_atoms_total, dtype=int)
+                for mol_idx, mol_indices in enumerate(components):
+                    local_perm = self._compute_ff_to_crystal_perm(
+                        off_mol, G_crys, mol_indices, atoms
+                    )
+                    mol_arr = np.array(mol_indices)
+                    for ff_local in range(n_per):
+                        self._ff_to_crystal[mol_idx * n_per + ff_local] = (
+                            mol_arr[local_perm[ff_local]]
+                        )
+                log.info(
+                    "Atom ordering permutation built via per-molecule position matching "
+                    f"({len(components)} independent isomorphisms)."
+                )
+
+                # Build crystal-atom bond graph from FF topology.
+                # Using FF bonds (not G_crys) avoids phantom bonds and missing
+                # cross-cell bonds. For each FF bond replicated across all
+                # molecules, map to crystal atom indices via ff_to_crystal.
+                import networkx as nx
+                G_topo = nx.Graph()
+                for gidx in range(self.n_atoms_total):
+                    G_topo.add_node(gidx)
+                for mol_idx in range(self.n_molecules):
+                    for bond in off_mol.bonds:
+                        ci = self._ff_to_crystal[mol_idx * n_per + bond.atom1_index]
+                        cj = self._ff_to_crystal[mol_idx * n_per + bond.atom2_index]
+                        G_topo.add_edge(ci, cj)
+
+                # Store for PBC unwrapping on every OpenMM call
+                self._components   = components
+                self._G_unwrap     = G_topo  # topology-based: no phantom, no missing
+
+            except Exception as e:
+                log.warning(
+                    f"Atom permutation failed ({e}). Using identity mapping — "
+                    "bonded terms will be WRONG if atoms are not stored "
+                    "molecule-contiguously in the crystal file."
+                )
+                self._ff_to_crystal = np.arange(self.n_atoms_total)
+                self._components    = None
+                self._G_unwrap      = None
+        else:
+            self._ff_to_crystal = np.arange(self.n_atoms_total)
+            self._components    = None
+            self._G_unwrap      = None
+
+        # Remove all intermolecular nonbonded terms
+        self._remove_intermolecular_nonbonded(omm_system)
+
+        # Optionally constrain all X-H bonds (fix_hbonds: true in YAML).
+        # Must be applied BEFORE context creation so the Context is
+        # initialised with the already-modified HarmonicBondForce.
+        if self.fix_hbonds:
+            n_hcon = self._apply_hbond_constraints(omm_system)
+            log.info(f"fix_hbonds=True: constrained {n_hcon} X-H bonds "
+                     f"(HarmonicBondForce k set to zero for those bonds)")
+
+        integrator       = mm.VerletIntegrator(0.001)
+        platform         = self._get_platform(platform_name)
+        props            = ({'CudaPrecision': 'double'}
+                            if 'CUDA' in platform.getName() else {})
+        self._context    = mm.Context(omm_system, integrator, platform, props)
+        self._platform_name = platform.getName()
+
+
+    def _apply_hbond_constraints(self, omm_system):
+        """
+        Constrain all X-H bonds in the OpenMM system.
+
+        For each bond in HarmonicBondForce that involves a hydrogen atom
+        (identified by particle mass < 2.0 amu):
+          1. Register an OpenMM constraint at the equilibrium length r0, so
+             that integrators using SHAKE/LINCS would enforce it during MD.
+          2. Set the HarmonicBondForce constant k to zero, removing the
+             X-H stretching contribution from the intramolecular energy and
+             forces.  This is the dominant effect for the Verlet-based energy
+             evaluator used here, where constraints are not enforced by the
+             integrator when positions are set manually.
+
+        Motivation: X-H stretches have very high frequencies (> 3000 cm⁻¹)
+        and therefore large zero-point energy and quantum tunnelling effects.
+        Including them in a classical intramolecular FF reference can inflate
+        the TI integrand <∂H/∂λ> unnecessarily.  Setting fix_hbonds: true
+        removes this contribution and produces a smoother, better-converged
+        TI integrand at lower computational cost.
+
+        Parameters
+        ----------
+        omm_system : openmm.System
+            The OpenMM System object (modified in place).
+
+        Returns
+        -------
+        int
+            Number of X-H bonds constrained.
+        """
+        import openmm as mm
+        import openmm.unit as unit
+
+        # Identify hydrogen atoms by mass: H = 1.008 amu.
+        # Use threshold < 2.0 amu to cover H but not D (2.014 amu) or
+        # any heavy atom.
+        n_atoms = omm_system.getNumParticles()
+        is_h = [
+            omm_system.getParticleMass(i).value_in_unit(unit.amu) < 2.0
+            for i in range(n_atoms)
+        ]
+
+        n_constrained = 0
+        for force in omm_system.getForces():
+            if not isinstance(force, mm.HarmonicBondForce):
+                continue
+            for bi in range(force.getNumBonds()):
+                a1, a2, r0, k = force.getBondParameters(bi)
+                if not (is_h[a1] or is_h[a2]):
+                    continue
+                # Register the rigid constraint at equilibrium length.
+                omm_system.addConstraint(a1, a2, r0)
+                # Zero the force constant: X-H stretching no longer
+                # contributes to energy or forces during evaluation.
+                force.setBondParameters(bi, a1, a2, r0, k * 0)
+                n_constrained += 1
+
+        return n_constrained
+
+
+    def _setup_gaff(self, mol_smiles, mol_sdf_file):
+        """
+        Parameterise with OpenFF SMIRNOFF force fields via openff-toolkit.
+        Returns (omm_system, off_mol).
+
+        Electrostatic charges are set to zero — AM1-BCC requires AmberTools/
+        OpenEye which are unavailable. Charges are irrelevant because all
+        nonbonded forces are stripped by _remove_intermolecular_nonbonded;
+        only bonded terms (bonds, angles, torsions, 1-4) survive.
+        """
+        try:
+            from openff.toolkit import Molecule, Topology as OFFTopology
+            from openff.toolkit.typing.engines.smirnoff import ForceField
+        except ImportError:
+            raise ImportError(
+                "openff-toolkit is required.\n"
+                "Install: conda install -c conda-forge openff-toolkit openff-forcefields"
+            )
+
+        import numpy as np
+        from openff.units import unit as offunit
+
+        if mol_smiles:
+            off_mol = Molecule.from_smiles(mol_smiles, allow_undefined_stereo=True)
+            off_mol.generate_conformers(n_conformers=1)
+        elif mol_sdf_file:
+            off_mol = Molecule.from_file(mol_sdf_file)
+        else:
+            raise ValueError("Provide mol_smiles or mol_sdf_file for GAFF setup.")
+
+        # Zero charges — nonbonded forces are stripped downstream anyway.
+        off_mol.partial_charges = (
+            np.zeros(off_mol.n_atoms) * offunit.elementary_charge
+        )
+
+        topology = OFFTopology.from_molecules([off_mol] * self.n_molecules)
+
+        ff_name_map = {
+            "gaff2":        "gaff-2.11.offxml",
+            "gaff":         "gaff-1.81.offxml",
+            "openff-2.2.1": "openff-2.2.1.offxml",
+            "openff-2.2.0": "openff-2.2.0.offxml",
+            "openff-2.1.1": "openff-2.1.1.offxml",
+            "openff-2.1.0": "openff-2.1.0.offxml",
+        }
+        ff_name = ff_name_map.get(self.ff_type, f"{self.ff_type}.offxml")
+        try:
+            ff = ForceField(ff_name)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not load '{ff_name}'.\n"
+                "Install: conda install -c conda-forge openff-forcefields\n"
+                f"Original error: {exc}"
+            )
+
+        # combine_nonbonded_forces=True → standard NonbondedForce →
+        # correctly stripped by _remove_intermolecular_nonbonded.
+        # CustomNonbondedForce (combine=False) would survive the strip.
+        try:
+            from openff.interchange import Interchange
+            interchange = Interchange.from_smirnoff(
+                ff, topology, charge_from_molecules=[off_mol]
+            )
+            omm_system = interchange.to_openmm(combine_nonbonded_forces=True)
+        except (ImportError, Exception):
+            omm_system = ff.create_openmm_system(
+                topology, charge_from_molecules=[off_mol]
+            )
+
+        return omm_system, off_mol
+
+    def _build_crystal_graph(self, atoms):
+        """
+        Build a PBC-aware bond graph of the full crystal supercell.
+
+        Uses get_all_distances(mic=True) instead of NeighborList, which
+        guarantees that bonds crossing ANY cell boundary are found — including
+        bonds that cross the original unit-cell boundary but are interior to a
+        supercell (e.g., two atoms at z=1.4 Ang and z=12.9 Ang in a 1x1x1
+        cell with c=13.3 Ang appear 11.5 Ang apart in a 1x2x2 cell and are
+        NOT found by NeighborList since 11.5 Ang >> bonding cutoff and the
+        supercell boundary wrapping does not help). get_all_distances(mic=True)
+        always returns the minimum-image distance, correctly finding the bond.
+
+        Returns a networkx.Graph where node labels are global atom indices.
+        """
+        try:
+            import networkx as nx
+        except ImportError:
+            raise ImportError("networkx required: pip install networkx")
+        from ase.data import covalent_radii, atomic_numbers
+
+        symbols = atoms.get_chemical_symbols()
+        n = len(atoms)
+
+        # All pairwise MIC distances — correct for any supercell geometry.
+        # O(n^2) memory and time, fine for n <= ~2000 atoms.
+        D = atoms.get_all_distances(mic=True)  # (n, n), Angstrom
+
+        G = nx.Graph()
+        for i, sym in enumerate(symbols):
+            G.add_node(i, element=sym)
+
+        mult = 1.2
+        for i in range(n):
+            an_i = atomic_numbers.get(symbols[i], 1)
+            ri   = covalent_radii[an_i]
+            for j in range(i + 1, n):
+                an_j = atomic_numbers.get(symbols[j], 1)
+                rj   = covalent_radii[an_j]
+                if D[i, j] < mult * (ri + rj):
+                    G.add_edge(i, j)
+
+        return G
+
+    def _unwrap_molecule_positions(self, atoms, mol_global_indices, G_crys_full):
+        """
+        Return Cartesian positions of one molecule with PBC wrapping removed.
+
+        ASE stores atoms in wrapped coordinates, so molecules that straddle
+        a periodic boundary have atoms on opposite sides of the cell.
+        We propagate from the first atom via BFS, applying the minimum-image
+        convention (MIC) at each bond so the resulting positions are a
+        geometrically coherent molecule in 3D space.
+
+        Parameters
+        ----------
+        atoms : ase.Atoms
+            Full supercell.
+        mol_global_indices : list of int
+            Global atom indices for this molecule.
+        G_crys_full : networkx.Graph
+            Full PBC-aware bond graph (edges from NeighborList with bothways=True).
+        """
+        from collections import deque
+        from ase.geometry import find_mic
+        import numpy as np
+
+        cell   = atoms.get_cell()
+        pbc    = atoms.get_pbc()
+        pos    = atoms.get_positions()
+        idx_set = set(mol_global_indices)
+
+        # BFS from the first atom, pulling each new atom to its nearest image
+        # relative to its already-placed bonded neighbour.
+        unwrapped = {}
+        root = mol_global_indices[0]
+        unwrapped[root] = pos[root].copy()
+        queue = deque([root])
+
+        while queue:
+            g      = queue.popleft()
+            g_pos  = unwrapped[g]
+            for nb in G_crys_full.neighbors(g):
+                if nb not in idx_set or nb in unwrapped:
+                    continue
+                diff       = pos[nb] - pos[g]
+                mic, _     = find_mic(diff[np.newaxis], cell, pbc)
+                unwrapped[nb] = g_pos + mic[0]
+                queue.append(nb)
+
+        return np.array([unwrapped[g] for g in mol_global_indices])
+
+    def _compute_ff_to_crystal_perm(self, off_mol, G_crys_full,
+                                    mol_global_indices, atoms):
+        """
+        Find local permutation: perm[ff_local_idx] = crystal_local_idx
+        where crystal_local_idx indexes into mol_global_indices.
+
+        Uses SUBGRAPH isomorphism: the crystal molecule subgraph has extra
+        phantom bonds (aromatic C atoms too close under natural_cutoffs ×1.2),
+        but all 25 true FF bonds are present inside it. We look for the FF
+        graph as a subgraph of the crystal graph, which succeeds even when
+        the crystal graph has extra edges.
+
+        GraphMatcher(G_crystal_mol, G_ff).subgraph_isomorphisms_iter()
+        returns mappings crystal_local → ff_local. We invert to get
+        ff_local → crystal_local = perm[ff_local].
+
+        All valid isomorphisms have the same RMSD for symmetric molecules
+        (C2v acridine has two valid mappings: mirror images). We pick the one
+        with the lower RMSD vs the unwrapped crystal positions to break the
+        tie correctly.
+        """
+        try:
+            import networkx as nx
+        except ImportError:
+            raise ImportError("networkx required: pip install networkx")
+        import numpy as np
+
+        all_elements = atoms.get_chemical_symbols()
+        n_per        = len(mol_global_indices)
+
+        # ---- Build crystal molecule subgraph (local indices 0..n_per-1) -
+        global_to_local = {g: l for l, g in enumerate(mol_global_indices)}
+        G_mol = nx.Graph()
+        for l, g in enumerate(mol_global_indices):
+            G_mol.add_node(l, element=all_elements[g])
+        for g in mol_global_indices:
+            for nb in G_crys_full.neighbors(g):
+                if nb in global_to_local:
+                    l1, l2 = global_to_local[g], global_to_local[nb]
+                    if l1 < l2:
+                        G_mol.add_edge(l1, l2)
+
+        # ---- Build FF molecule graph ------------------------------------
+        G_ff = nx.Graph()
+        for i, atom in enumerate(off_mol.atoms):
+            G_ff.add_node(i, element=atom.symbol)
+        for bond in off_mol.bonds:
+            G_ff.add_edge(bond.atom1_index, bond.atom2_index)
+
+        def node_match(n1, n2):
+            return n1['element'] == n2['element']
+
+        # ---- Subgraph isomorphism: find G_ff inside G_mol ---------------
+        # GM(G, SG): finds SG as a subgraph of G.
+        # Mapping: G_node (crystal_local) → SG_node (ff_local)
+        # Use MONOMORPHISM (non-induced subgraph isomorphism):
+        # Every FF edge must map to a crystal edge, but the crystal subgraph
+        # may have extra phantom bonds between mapped nodes — that is fine.
+        # Induced subgraph isomorphism (subgraph_is_isomorphic) would fail
+        # because phantom intra-molecular bonds in the crystal give the N
+        # degree 3 instead of 2 in the FF, creating extra edges in the mapped
+        # subgraph that make it non-isomorphic to G_ff.
+        GM = nx.algorithms.isomorphism.GraphMatcher(
+            G_mol, G_ff, node_match=node_match
+        )
+        if not GM.subgraph_is_monomorphic():
+            raise ValueError(
+                "FF graph cannot be monomorphically embedded in the crystal "
+                "molecule graph. Check mol_smiles. Crystal mol edges: "
+                f"{G_mol.number_of_edges()}, FF edges: {G_ff.number_of_edges()}"
+            )
+
+        # ---- Unwrap crystal positions for RMSD tiebreak ----------------
+        crystal_pos  = self._unwrap_molecule_positions(
+            atoms, mol_global_indices, G_crys_full
+        )
+        ff_conf = np.array(off_mol.conformers[0].magnitude)  # Å, (n_per, 3)
+
+        best_perm = None
+        best_rmsd = np.inf
+
+        for crystal_to_ff in GM.subgraph_monomorphisms_iter():
+            # Invert: ff_local → crystal_local
+            ff_to_cr = {v: k for k, v in crystal_to_ff.items()}
+            perm = np.array([ff_to_cr[i] for i in range(off_mol.n_atoms)])
+
+            # Kabsch alignment using THIS permutation as the correspondence.
+            # Self-consistent: perm defines which FF atom maps to which crystal
+            # atom, so we can compute the optimal rotation and get a meaningful
+            # RMSD. This correctly distinguishes C2v mirror-image solutions
+            # where a centre-only tiebreak fails.
+            cr_c = crystal_pos[perm] - crystal_pos[perm].mean(axis=0)
+            ff_c = ff_conf           - ff_conf.mean(axis=0)
+            H         = ff_c.T @ cr_c
+            U, _, Vt  = np.linalg.svd(H)
+            d         = np.sign(np.linalg.det(Vt.T @ U.T))
+            R         = Vt.T @ np.diag([1.0, 1.0, d]) @ U.T
+            ff_rot    = (R @ ff_c.T).T + crystal_pos[perm].mean(axis=0)
+            rmsd      = float(np.sqrt(np.mean(
+                np.sum((ff_rot - crystal_pos[perm])**2, axis=1)
+            )))
+            if rmsd < best_rmsd:
+                best_rmsd = rmsd
+                best_perm = perm.copy()
+
+        import logging
+        logging.getLogger(__name__).info(
+            f"Permutation found via subgraph monomorphism, RMSD={best_rmsd:.4f} Ang"
+        )
+        print(f"[IntramolFF] Permutation RMSD vs crystal: {best_rmsd:.4f} Ang")
+        return best_perm
+
+
+    def _setup_opls(self, mol_smiles, mol_sdf_file):
+        """
+        Parameterise with OPLS-AA via openmmforcefields.
+        Requires: openmmforcefields
+          pip install openmmforcefields
+        """
+        try:
+            from openmmforcefields.generators import SMIRNOFFTemplateGenerator
+            from openff.toolkit import Molecule, Topology as OFFTopology
+            from openmm.app import ForceField as OMMForceField
+        except ImportError:
+            raise ImportError(
+                "openmmforcefields is required for OPLS-AA.\n"
+                "Install: pip install openmmforcefields"
+            )
+
+        if mol_smiles:
+            off_mol = Molecule.from_smiles(mol_smiles, allow_undefined_stereo=True)
+        elif mol_sdf_file:
+            off_mol = Molecule.from_file(mol_sdf_file)
+        else:
+            raise ValueError("Provide mol_smiles or mol_sdf_file for OPLS setup.")
+
+        generator = SMIRNOFFTemplateGenerator(
+            molecules=[off_mol], forcefield='openff-2.1.0'
+        )
+        ff = OMMForceField('amber14-all.xml')
+        ff.registerTemplateGenerator(generator.generator)
+
+        topology     = OFFTopology.from_molecules([off_mol] * self.n_molecules)
+        omm_topology = topology.to_openmm()
+        return ff.createSystem(omm_topology)
+
+    def _remove_intermolecular_nonbonded(self, omm_system):
+        """
+        Strip NonbondedForce from the system and replace with a
+        CustomBondForce containing only the intramolecular 1-4 exceptions.
+
+        Logic:
+        - HarmonicBondForce / HarmonicAngleForce / PeriodicTorsionForce
+          are purely intramolecular by construction → keep untouched.
+        - NonbondedForce handles intermolecular LJ+electrostatics AND
+          intramolecular 1-4 (stored as "exceptions" with non-zero params).
+          → Remove the NonbondedForce entirely, rescue the 1-4 exceptions
+            into a CustomBondForce.
+        - Exceptions with chargeprod ≈ 0 AND epsilon ≈ 0 are 1-2/1-3
+          full exclusions → skip.
+        """
+        import openmm as mm
+        import openmm.unit as unit
+
+        nb_indices = [
+            i for i, f in enumerate(omm_system.getForces())
+            if isinstance(f, mm.NonbondedForce)
+        ]
+
+        rescued_forces = []
+
+        for idx in nb_indices:
+            nb = omm_system.getForce(idx)
+
+            # CustomBondForce for 1-4 scaled interactions
+            # E = ONE_4PIE0 * q1*q2/r  +  4*eps*[(sig/r)^12 - (sig/r)^6]
+            f14 = mm.CustomBondForce(
+                "ONE_4PIE0 * chargeprod / r "
+                "+ 4 * eps14 * ((sig14/r)^12 - (sig14/r)^6)"
+            )
+            f14.addGlobalParameter("ONE_4PIE0", 138.935456)  # nm·kJ/mol/e^2
+            f14.addPerBondParameter("chargeprod")  # e^2
+            f14.addPerBondParameter("sig14")       # nm
+            f14.addPerBondParameter("eps14")       # kJ/mol
+
+            n_rescued = 0
+            for ex in range(nb.getNumExceptions()):
+                p1, p2, chargeprod, sigma, epsilon = nb.getExceptionParameters(ex)
+                cp  = chargeprod.value_in_unit(unit.elementary_charge ** 2)
+                sig = sigma.value_in_unit(unit.nanometer)
+                eps = epsilon.value_in_unit(unit.kilojoule_per_mole)
+                # Skip 1-2 and 1-3 full exclusions (zeroed out)
+                if abs(cp) > 1e-12 or abs(eps) > 1e-12:
+                    f14.addBond(p1, p2, [cp, sig, eps])
+                    n_rescued += 1
+
+            if n_rescued > 0:
+                rescued_forces.append(f14)
+
+        # Remove NonbondedForce(s) in reverse order to preserve indices
+        for idx in reversed(nb_indices):
+            omm_system.removeForce(idx)
+
+        for f in rescued_forces:
+            omm_system.addForce(f)
+
+    def _get_platform(self, preferred):
+        """Return best available OpenMM platform with graceful fallback."""
+        import openmm as mm
+        for name in (preferred, 'OpenCL', 'CPU', 'Reference'):
+            try:
+                return mm.Platform.getPlatformByName(name)
+            except Exception:
+                continue
+        return mm.Platform.getPlatformByName('Reference')
+
+
+    def _unwrap_positions_for_openmm(self, positions_ang):
+        """
+        Unwrap molecule positions from PBC before passing to OpenMM.
+
+        OpenMM bonded forces do NOT apply minimum-image convention — they use
+        raw atom coordinates.  Molecules straddling a periodic boundary have
+        bonds that appear many Angstroms long, giving enormous bonded energies.
+
+        Root cause for supercells created by ASE repeat([nx,ny,nz]):
+        The BFS walks atom-by-atom and uses the ACCUMULATED unwrapped position
+        of each parent atom as the reference for placing the next atom.  After
+        several bond steps a molecule that straddles multiple primitive-cell
+        boundaries can leave a parent atom (g) displaced by ±2 or more primitive
+        lattice vectors from its raw crystal position.  The child atom (nb) in
+        the raw crystal sits at the far end of the supercell.  The required image
+        correction is then -2×c_prim or larger — far outside any fixed ±1 or
+        ±0.5 fractional search range based on the supercell or primitive cell.
+
+        Fix: replace the fixed-range image search with ASE find_mic applied to
+        the PRIMITIVE cell.  find_mic analytically computes the integer lattice
+        translation n that minimises |diff + n·prim_cell|, correctly handling
+        monoclinic off-diagonal coupling and any BFS-accumulated drift.  The
+        primitive cell is stored in self._prim_cell and passed from the
+        pre-replication initial_atoms at construction time.
+        """
+        if self._components is None or self._G_unwrap is None:
+            return positions_ang  # no topology available, return as-is
+
+        from collections import deque
+        from ase.geometry import find_mic
+
+        prim_pbc  = np.array([True, True, True])
+        unwrapped = positions_ang.copy()
+
+        for mol_indices in self._components:
+            mol_set = set(mol_indices)
+            root    = mol_indices[0]
+            visited = {root}
+            queue   = deque([root])
+            while queue:
+                g = queue.popleft()
+                for nb in self._G_unwrap.neighbors(g):
+                    if nb not in mol_set or nb in visited:
+                        continue
+
+                    # Diff from the UNWRAPPED parent: self-consistent per step,
+                    # prevents error accumulation along the BFS chain.
+                    diff = positions_ang[nb] - unwrapped[g]
+
+                    # find_mic on the primitive cell finds the exact integer
+                    # lattice translation minimising |diff + n·prim_cell|,
+                    # regardless of the magnitude of accumulated BFS drift.
+                    mic_vec, _ = find_mic(
+                        diff[np.newaxis],   # shape (1, 3)
+                        self._prim_cell,
+                        prim_pbc,
+                    )
+                    unwrapped[nb] = unwrapped[g] + mic_vec[0]
+                    visited.add(nb)
+                    queue.append(nb)
+
+        return unwrapped
+
+    def _eval_energy_only(self, positions_ang):
+        """Evaluate energy (eV) at given Angstrom positions (no results stored)."""
+        import openmm.unit as unit
+        import logging
+        log = logging.getLogger(__name__)
+
+        # Unwrap first: OpenMM bonded forces need continuous molecule geometry
+        unwrapped = self._unwrap_positions_for_openmm(positions_ang)
+        omm_pos   = unwrapped[self._ff_to_crystal]
+
+        # Diagnostic: check max bond stretch after unwrapping
+        if self._components is not None and self._G_unwrap is not None:
+            max_stretch = 0.0
+            for u, v in list(self._G_unwrap.edges())[:50]:
+                d = float(np.linalg.norm(unwrapped[u] - unwrapped[v]))
+                if d > max_stretch:
+                    max_stretch = d
+            log.info(f"[DiagUnwrap] max bond length after unwrap: {max_stretch:.4f} Ang "
+                     f"(should be < 2.0 Ang)")
+            print(f"[DiagUnwrap] max bond length after unwrap: {max_stretch:.4f} Ang")
+
+        self._context.setPositions(omm_pos * 0.1 * unit.nanometer)
+        state = self._context.getState(getEnergy=True)
+        e = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole) * self._KJ_MOL_TO_EV
+        log.info(f"[DiagEnergy] raw FF energy at q0: {e:.4f} eV "
+                 f"({e/self.n_molecules:.4f} eV/mol)")
+        print(f"[DiagEnergy] raw FF energy at q0: {e:.4f} eV "
+              f"({e/self.n_molecules:.4f} eV/mol)")
+        return e
+
+    # ------------------------------------------------------------------
+    # ASE Calculator interface
+    # ------------------------------------------------------------------
+
+    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+        if properties is None:
+            properties = ['energy', 'forces']
+        super().calculate(atoms, properties, system_changes)
+
+        import openmm.unit as unit
+
+        # Unwrap molecule positions before passing to OpenMM.
+        # Crystal positions are PBC-wrapped; OpenMM bonded forces don't use
+        # minimum-image convention, so molecules straddling the cell boundary
+        # would have their bonds computed as ~10 Å (enormous energy/forces).
+        current_pos = self.atoms.get_positions()
+        unwrapped   = self._unwrap_positions_for_openmm(current_pos)
+        omm_pos     = unwrapped[self._ff_to_crystal]
+        self._context.setPositions(omm_pos * 0.1 * unit.nanometer)
+        state = self._context.getState(getEnergy=True, getForces=True)
+
+        energy_ev = (
+            state.getPotentialEnergy()
+            .value_in_unit(unit.kilojoule_per_mole)
+            * self._KJ_MOL_TO_EV
+            - self._ref_energy_shift
+        )
+
+        # Forces from OpenMM are in FF order — map back to crystal/ASE order
+        ff_forces = (
+            np.array(
+                state.getForces(asNumpy=True)
+                .value_in_unit(unit.kilojoule_per_mole / unit.nanometer)
+            )
+            * self._FORCE_CONV
+        )
+        crystal_forces = np.empty_like(ff_forces)
+        crystal_forces[self._ff_to_crystal] = ff_forces
+
+        self.results = {'energy': energy_ev, 'forces': crystal_forces}
+
+
+class CombinedReferenceCalculator(Calculator):
+    """
+    Combines EinsteinCrystalCalculator + IntramolecularFFCalculator into
+    a single ASE Calculator for use as the TI reference state.
+
+        U_ref(q) = U_einstein(q)  +  ΔU_intramol(q)
+
+    If intramol_calc is None, this reduces to a pure Einstein crystal.
+    """
+
+    implemented_properties = ['energy', 'forces']
+
+    def __init__(self, einstein_calc, intramol_calc=None, **kwargs):
+        super().__init__(**kwargs)
+        self.einstein_calc = einstein_calc
+        self.intramol_calc = intramol_calc
+
+    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+        if properties is None:
+            properties = ['energy', 'forces']
+        super().calculate(atoms, properties, system_changes)
+
+        self.einstein_calc.calculate(self.atoms, properties, system_changes)
+        e = self.einstein_calc.results['energy']
+        f = self.einstein_calc.results['forces'].copy()
+
+        if self.intramol_calc is not None:
+            self.intramol_calc.calculate(self.atoms, properties, system_changes)
+            e += self.intramol_calc.results['energy']
+            f  = f + self.intramol_calc.results['forces']
+
+        self.results = {'energy': e, 'forces': f}
+
 
 class EinsteinCrystalCalculator(Calculator):
     """
@@ -2765,8 +3775,6 @@ class LambdaCalculator(Calculator):
             'energy': e_lambda,
             'forces': f_lambda,
         }
-
-
 
 
 def main():
