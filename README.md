@@ -339,56 +339,55 @@ energy_drift_start_time_ps: 0.1  # Skip initial equilibration (ps) only for NVE
 ```
 ---
 
-### Thermodynamic Integration (Lambda-Static TI)
+## Thermodynamic Integration (Lambda-Static TI)
 
 Computes free energy differences between the physical MACE potential and an Einstein crystal reference via lambda-static TI.
 
-#### Coupling Schemes
+---
+
+### Coupling Schemes
 
 **Standard TI** (Kirkwood 1935):
+
 $$U(\lambda) = \lambda\,U_\text{phys} + (1-\lambda)\,U_0, \qquad \frac{\partial U}{\partial\lambda} = U_\text{phys} - U_0$$
 
 **REG TI** — default (Kapil, *J. Chem. Phys.* **164**, 051101, 2026):
-$$U(\lambda) = \lambda^m U_\text{phys} + (1-\lambda)^m U_0, \qquad \frac{\partial U}{\partial\lambda} = m\!\left[\lambda^{m-1}U_\text{phys} - (1-\lambda)^{m-1}U_0\right]$$
 
-#### Einstein Crystal Reference
+$$U(\lambda) = \lambda^m U_\text{phys} + (1-\lambda)^m U_0, \qquad \frac{\partial U}{\partial\lambda} = m\left[\lambda^{m-1}U_\text{phys} - (1-\lambda)^{m-1}U_0\right]$$
 
-The reference is a harmonic potential anchored at the geometry-optimised structure $\mathbf{q}_0$:
-$$U_0(\mathbf{q}) = U(\mathbf{q}_0) + \frac{\kappa}{2}\sum_i|\mathbf{r}_i - \mathbf{r}_i^0|^2$$
+---
 
-The offset $U(\mathbf{q}_0)$ ensures both potentials coincide at the reference geometry. MIC is applied when PBC are active.
+### Reference Potential
+
+The reference is an Einstein crystal optionally augmented with an intramolecular force field:
+
+$$U_0(\mathbf{q}) = U(\mathbf{q}_0) + \frac{\kappa}{2}\sum_i|\mathbf{r}_i - \mathbf{r}_i^0|^2 + \Delta U_\text{FF}(\mathbf{q})$$
+
+where $\Delta U_\text{FF} = U_\text{FF}(\mathbf{q}) - U_\text{FF}(\mathbf{q}_0)$ is the intramolecular FF contribution shifted to zero at $\mathbf{q}_0$. When `intramolecular_ff` is disabled, $\Delta U_\text{FF} = 0$. MIC is applied to Einstein displacements when PBC are active.
 
 > **Prerequisite:** `geo_opt: true` must be enabled so that $\mathbf{q}_0$ is defined before any TI run.
 
-If `einstein_kappa` is not set manually, it is auto-fitted from a short NVT pre-run via equipartition:
+If `einstein_kappa` is not set, it is auto-fitted from a short NVT pre-run via equipartition:
+
 $$\kappa = \frac{3k_\text{B}T}{\langle|\mathbf{r}_i - \mathbf{r}_i^0|^2\rangle}$$
 
-The fitted $\kappa$ is cached and reused for all $\lambda$ windows at the same temperature.
+The fitted $\kappa$ is cached and reused across all $\lambda$ windows at the same temperature.
 
-#### Configuration
+---
 
-```yaml
-thermodynamic_integration:
-  enabled: true
+### Intramolecular Force Field
 
-  mode: 'reg_ti'           # 'reg_ti' (recommended) or 'standard_ti'
-  m: 6                     # REG TI exponent
+An OpenFF/GAFF force field can be included in $U_0$ to improve overlap with the physical potential, reducing TI variance. The FF is evaluated via OpenMM and runs on GPU.
 
-  lambda_values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-  temperatures: [300]      # K
+Key implementation details:
 
-  md_steps_per_lambda: 50000    # Production steps per window
-  equilibration_steps: 5000     # Discarded in post-processing (ti_analysis.py)
-  ti_save_interval: 20          # Logging frequency (steps)
+- **PBC unwrapping:** BFS-based molecular unwrapping using ASE `find_mic` on the primitive (pre-replication) cell, so cross-boundary corrections are found exactly for any supercell size.
+- **Per-molecule topology:** Graph isomorphism permutations are computed independently per molecule, correctly handling symmetry-distinct orientations in low-symmetry space groups (e.g. P2₁/c).
+- **H-bond constraints** (`fix_hbonds: true`): X–H bond stretching terms are removed from the FF energy and replaced by OpenMM rigid constraints, reducing high-frequency noise in $\partial U/\partial\lambda$.
 
-  # einstein_kappa: 2.5         # eV/Å² — leave unset to auto-fit (recommended)
-  kappa_fit_steps: 2000
-  kappa_sample_interval: 10
-```
+---
 
-The thermostat is set via the top-level `thermostat` key.
-
-#### Output
+### Output
 
 Each window writes a log to `results/ti_trajectories/ti_lambda<X.XXXX>_<T>K.log` with columns:
 
@@ -402,9 +401,41 @@ Each window writes a log to `results/ti_trajectories/ti_lambda<X.XXXX>_<T>K.log`
 
 Mean and std of $\langle\partial U/\partial\lambda\rangle$ are appended as a summary at the end of each log. Integration over $\lambda$ to obtain $\Delta F$ is performed by `ti_analysis.py`.
 
-#### Caching
+---
 
-Each $\lambda$ window is cached independently. Re-running with identical parameters (structure, `lambda_values`, `temperatures`, `md_steps_per_lambda`, `mode`, `m`) loads results from cache, skipping the MD entirely. The fitted $\kappa$ is also cached per temperature.
+### Caching
+
+Each $\lambda$ window is cached independently. Re-running with identical parameters (`structure`, `lambda_values`, `temperatures`, `md_steps_per_lambda`, `mode`, `m`) loads results from cache, skipping the MD entirely. The fitted $\kappa$ is also cached per temperature.
+
+---
+
+### Configuration
+
+```yaml
+thermodynamic_integration:
+  enabled: true
+  mode: 'reg_ti'                # 'reg_ti' (recommended) or 'standard_ti'
+  m: 6                          # REG TI exponent
+  lambda_values: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  temperatures: [300]           # K
+  md_steps_per_lambda: 50000
+  equilibration_steps: 5000     # discarded in ti_analysis.py
+  ti_save_interval: 20
+  # einstein_kappa: 2.5         # eV/Å² — leave unset to auto-fit (recommended)
+  kappa_fit_steps: 2000
+  kappa_sample_interval: 10
+
+  intramolecular_ff:
+    enabled: true
+    ff_type: 'openff-2.2.1'             # or 'gaff2'
+    mol_smiles: 'c1ccc2nc3ccccc3cc2c1'  # acridine; or use mol_sdf_file
+    n_molecules: 32                     # must match simulation supercell
+    zero_at_reference: true             # shift FF to zero at q0
+    fix_hbonds: true                    # constrain X–H bonds (recommended)
+    openmm_platform: 'CUDA'
+```
+
+> The thermostat is set via the top-level `thermostat` key.
 
 
 ##### 📈 Radial Distribution Function Analysis settings
